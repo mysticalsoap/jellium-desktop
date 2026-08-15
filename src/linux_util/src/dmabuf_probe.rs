@@ -9,7 +9,7 @@
 
 use crate::egl;
 use drm_fourcc::DrmFourcc;
-use libloading::Library;
+use libloading::{Library, Symbol};
 use nix::fcntl::{OFlag, open};
 use nix::sys::stat::Mode;
 use std::ffi::{CStr, CString, c_char, c_int, c_uint, c_void};
@@ -21,6 +21,9 @@ use std::ptr;
 const GL_TEXTURE_2D: c_uint = 0x0DE1;
 const GL_NO_ERROR: c_uint = 0;
 const GBM_BO_USE_RENDERING: u32 = 0x0002;
+// Sentinel meaning "no explicit modifier" — never a real advertised modifier,
+// filtered out of eglQueryDmaBufModifiersEXT results defensively.
+const DRM_FORMAT_MOD_INVALID: u64 = 0x00ff_ffff_ffff_ffff;
 
 const EGL_PLATFORM_X11_KHR: egl::Enum = 0x31D5;
 const EGL_LINUX_DMA_BUF_EXT: egl::Enum = 0x3270;
@@ -28,6 +31,8 @@ const EGL_LINUX_DRM_FOURCC_EXT: egl::Int = 0x3271;
 const EGL_DMA_BUF_PLANE0_FD_EXT: egl::Int = 0x3272;
 const EGL_DMA_BUF_PLANE0_OFFSET_EXT: egl::Int = 0x3273;
 const EGL_DMA_BUF_PLANE0_PITCH_EXT: egl::Int = 0x3274;
+const EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT: egl::Int = 0x3443;
+const EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT: egl::Int = 0x3444;
 const EGL_DEVICE_EXT: egl::Int = 0x322C;
 const EGL_DRM_RENDER_NODE_FILE_EXT: egl::Int = 0x3377;
 
@@ -41,6 +46,11 @@ type FnGbmBoCreate = unsafe extern "C" fn(*mut GbmDevice, u32, u32, u32, u32) ->
 type FnGbmBoDestroy = unsafe extern "C" fn(*mut GbmBo);
 type FnGbmBoGetFd = unsafe extern "C" fn(*mut GbmBo) -> c_int;
 type FnGbmBoGetStride = unsafe extern "C" fn(*mut GbmBo) -> u32;
+// Optional: only present on libgbm >= 17.1. Missing means the driver only
+// exposed the modifier-less API, so we fall back to implicit gbm_bo_create.
+type FnGbmBoCreateWithModifiers =
+    unsafe extern "C" fn(*mut GbmDevice, u32, u32, u32, *const u64, c_uint) -> *mut GbmBo;
+type FnGbmBoGetModifier = unsafe extern "C" fn(*mut GbmBo) -> u64;
 
 type FnXOpenDisplay = unsafe extern "C" fn(*const c_char) -> *mut X11Display;
 type FnXCloseDisplay = unsafe extern "C" fn(*mut X11Display) -> c_int;
@@ -64,6 +74,14 @@ type FnEglDestroyImageKhr = unsafe extern "C" fn(egl::EGLDisplay, *mut c_void) -
 type FnEglQueryDisplayAttribExt =
     unsafe extern "C" fn(egl::EGLDisplay, egl::Int, *mut isize) -> c_uint;
 type FnEglQueryDeviceStringExt = unsafe extern "C" fn(*mut c_void, egl::Int) -> *const c_char;
+type FnEglQueryDmaBufModifiersExt = unsafe extern "C" fn(
+    egl::EGLDisplay,
+    egl::Int,
+    egl::Int,
+    *mut u64,
+    *mut c_uint,
+    *mut egl::Int,
+) -> c_uint;
 
 /// Returns true if a GBM-allocated ARGB8888 dmabuf can be imported as an EGL
 /// image and bound to a GL texture on the EGL display CEF will use. The
@@ -104,6 +122,7 @@ fn probe(ozone: &str, wayland_egl_dpy: *mut c_void) -> Result<bool, String> {
     let egl = egl::load()?;
 
     let (display, owns_display, _x11_state) = acquire_display(&egl, ozone, wayland_egl_dpy)?;
+    let nvidia = is_nvidia_vendor(&egl, display);
 
     let result = (|| -> Result<bool, String> {
         egl.bind_api(khronos_egl::OPENGL_ES_API)
@@ -168,7 +187,28 @@ fn probe(ozone: &str, wayland_egl_dpy: *mut c_void) -> Result<bool, String> {
         Ok(false) => tracing::warn!("dmabuf probe: ARGB8888 dmabuf import failed"),
         Err(e) => tracing::warn!("dmabuf probe: {}", e),
     }
+
+    // Even when the transport test passes on NVIDIA, CEF's OSR shared-texture
+    // path fails one layer up: Chromium can't wrap the imported buffer as a
+    // writable render target ("Unable to initialize SkSurface" in
+    // shared_image_representation.cc), leaving a blank window. Electron hits
+    // the same failure and closed it unfixed (electron/electron#49247), so
+    // stay on the software path regardless of the transport result.
+    if nvidia {
+        tracing::warn!(
+            "dmabuf probe: blocking shared textures on NVIDIA; CEF OSR path broken \
+             upstream (electron/electron#49247)"
+        );
+        return Ok(false);
+    }
     result
+}
+
+/// True if the EGL display's driver vendor string identifies NVIDIA's
+/// proprietary driver, which advertises `EGL_VENDOR` as "NVIDIA".
+fn is_nvidia_vendor(egl: &egl::Egl, display: egl::Display) -> bool {
+    egl.query_string(Some(display), khronos_egl::VENDOR)
+        .is_ok_and(|s| s.to_str().is_ok_and(|s| s.contains("NVIDIA")))
 }
 
 struct X11Owned {
@@ -243,6 +283,56 @@ fn acquire_display(
     Ok((display, true, Some(owned)))
 }
 
+/// Modifiers the driver advertises for ARGB8888, dropping external-only
+/// entries (not usable as a plain sampled 2D texture). Empty when
+/// `EGL_EXT_image_dma_buf_import_modifiers` isn't available — callers fall
+/// back to implicit-modifier import in that case.
+fn query_argb8888_modifiers(egl: &egl::Egl, display: egl::Display) -> Vec<u64> {
+    let Ok(query) = get_gl::<FnEglQueryDmaBufModifiersExt>(egl, "eglQueryDmaBufModifiersEXT")
+    else {
+        return Vec::new();
+    };
+    let fourcc = DrmFourcc::Argb8888 as egl::Int;
+    let display = display.as_ptr();
+    let mut count: egl::Int = 0;
+    let queried = unsafe {
+        query(
+            display,
+            fourcc,
+            0,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut count,
+        )
+    };
+    if queried == 0 || count <= 0 {
+        return Vec::new();
+    }
+
+    let mut modifiers = vec![0u64; count as usize];
+    let mut external_only = vec![0u32; count as usize];
+    let queried = unsafe {
+        query(
+            display,
+            fourcc,
+            count,
+            modifiers.as_mut_ptr(),
+            external_only.as_mut_ptr(),
+            &mut count,
+        )
+    };
+    if queried == 0 {
+        return Vec::new();
+    }
+
+    modifiers
+        .into_iter()
+        .zip(external_only)
+        .filter(|(m, external)| *external == 0 && *m != DRM_FORMAT_MOD_INVALID)
+        .map(|(m, _)| m)
+        .collect()
+}
+
 fn run_gl_test(egl: &egl::Egl, display: egl::Display) -> Result<bool, String> {
     let gen_tex = get_gl::<FnGlGenTextures>(egl, "glGenTextures")?;
     let bind_tex = get_gl::<FnGlBindTexture>(egl, "glBindTexture")?;
@@ -280,18 +370,76 @@ fn run_gl_test(egl: &egl::Egl, display: egl::Display) -> Result<bool, String> {
         return Err("gbm_create_device failed".into());
     }
 
-    let bo = unsafe {
-        (gbm.bo_create)(
-            device,
-            64,
-            64,
-            DrmFourcc::Argb8888 as u32,
-            GBM_BO_USE_RENDERING,
-        )
+    // NVIDIA's EGL/GBM stack doesn't support implicit-modifier dmabuf import
+    // the way Mesa does — glEGLImageTargetTexture2DOES fails with
+    // GL_INVALID_OPERATION unless we negotiate an explicit one. Missing
+    // symbols or an empty modifier list both fall through to the pre-existing
+    // implicit gbm_bo_create path, so Mesa drivers are unaffected.
+    let create_with_modifiers: Option<FnGbmBoCreateWithModifiers> = unsafe {
+        gbm_lib
+            .get(b"gbm_bo_create_with_modifiers\0")
+            .ok()
+            .map(|s: Symbol<FnGbmBoCreateWithModifiers>| *s)
+    };
+    let get_modifier: Option<FnGbmBoGetModifier> = unsafe {
+        gbm_lib
+            .get(b"gbm_bo_get_modifier\0")
+            .ok()
+            .map(|s: Symbol<FnGbmBoGetModifier>| *s)
+    };
+    let modifiers = query_argb8888_modifiers(egl, display);
+
+    let (bo, modifier) = match (create_with_modifiers, get_modifier, modifiers.is_empty()) {
+        (Some(create), Some(get_mod), false) => {
+            let bo = unsafe {
+                create(
+                    device,
+                    64,
+                    64,
+                    DrmFourcc::Argb8888 as u32,
+                    modifiers.as_ptr(),
+                    modifiers.len() as c_uint,
+                )
+            };
+            if bo.is_null() {
+                tracing::warn!(
+                    "dmabuf probe: gbm_bo_create_with_modifiers failed, falling back to implicit modifier"
+                );
+                (
+                    unsafe {
+                        (gbm.bo_create)(
+                            device,
+                            64,
+                            64,
+                            DrmFourcc::Argb8888 as u32,
+                            GBM_BO_USE_RENDERING,
+                        )
+                    },
+                    None,
+                )
+            } else {
+                (bo, Some(unsafe { get_mod(bo) }))
+            }
+        }
+        _ => (
+            unsafe {
+                (gbm.bo_create)(
+                    device,
+                    64,
+                    64,
+                    DrmFourcc::Argb8888 as u32,
+                    GBM_BO_USE_RENDERING,
+                )
+            },
+            None,
+        ),
     };
     if bo.is_null() {
         unsafe { (gbm.device_destroy)(device) };
         return Err("gbm_bo_create ARGB8888 failed".into());
+    }
+    if let Some(m) = modifier {
+        tracing::info!("dmabuf probe: using explicit modifier 0x{:x}", m);
     }
 
     let raw_dmabuf_fd = unsafe { (gbm.bo_get_fd)(bo) };
@@ -299,7 +447,7 @@ fn run_gl_test(egl: &egl::Egl, display: egl::Display) -> Result<bool, String> {
     let stride = unsafe { (gbm.bo_get_stride)(bo) };
 
     let result = if let Some(dmabuf_fd) = &dmabuf_fd {
-        let img_attrs: [egl::Int; 13] = [
+        let mut img_attrs: Vec<egl::Int> = vec![
             khronos_egl::WIDTH,
             64,
             khronos_egl::HEIGHT,
@@ -312,8 +460,16 @@ fn run_gl_test(egl: &egl::Egl, display: egl::Display) -> Result<bool, String> {
             0,
             EGL_DMA_BUF_PLANE0_PITCH_EXT,
             stride as egl::Int,
-            khronos_egl::NONE,
         ];
+        if let Some(m) = modifier {
+            img_attrs.extend([
+                EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT,
+                (m & 0xffff_ffff) as egl::Int,
+                EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT,
+                (m >> 32) as egl::Int,
+            ]);
+        }
+        img_attrs.push(khronos_egl::NONE);
         let image = unsafe {
             create_image(
                 display.as_ptr(),
@@ -325,8 +481,9 @@ fn run_gl_test(egl: &egl::Egl, display: egl::Display) -> Result<bool, String> {
         };
         if image.is_null() {
             tracing::warn!(
-                "dmabuf probe: eglCreateImageKHR failed ({:?})",
-                egl.get_error()
+                "dmabuf probe: eglCreateImageKHR failed ({:?}, modifier={:?})",
+                egl.get_error(),
+                modifier
             );
             Ok(false)
         } else {
